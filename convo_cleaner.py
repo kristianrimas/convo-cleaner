@@ -38,6 +38,8 @@ class ConvoCleanerApp:
         # Data storage
         self.groups_data = {}
         self.session_lookup = {}
+        self._sort_column = None
+        self._sort_reverse = False
 
         self.setup_ui()
         self.load_all()
@@ -72,14 +74,22 @@ class ConvoCleanerApp:
         columns = ("summary", "msgs", "created", "modified", "branch", "cwd", "size")
         self.tree = ttk.Treeview(tree_frame, columns=columns, selectmode="extended")
 
-        self.tree.heading("#0", text="Project / Session", anchor=tk.W)
-        self.tree.heading("summary", text="Summary", anchor=tk.W)
-        self.tree.heading("msgs", text="Msgs", anchor=tk.CENTER)
-        self.tree.heading("created", text="Created", anchor=tk.W)
-        self.tree.heading("modified", text="Modified", anchor=tk.W)
-        self.tree.heading("branch", text="Branch", anchor=tk.W)
-        self.tree.heading("cwd", text="CWD", anchor=tk.W)
-        self.tree.heading("size", text="Size", anchor=tk.E)
+        self._heading_labels = {
+            "#0": "Project / Session",
+            "summary": "Summary",
+            "msgs": "Msgs",
+            "created": "Created",
+            "modified": "Modified",
+            "branch": "Branch",
+            "cwd": "CWD",
+            "size": "Size",
+        }
+        heading_anchors = {"msgs": tk.CENTER, "size": tk.E}
+        for col, label in self._heading_labels.items():
+            self.tree.heading(
+                col, text=label, anchor=heading_anchors.get(col, tk.W),
+                command=lambda c=col: self.sort_by(c),
+            )
 
         self.tree.column("#0", width=250, minwidth=180)
         self.tree.column("summary", width=280, minwidth=180)
@@ -153,6 +163,9 @@ class ConvoCleanerApp:
         claude_sessions, claude_size = self._load_claude_sessions()
         desktop_sessions, desktop_size = self._load_desktop_sessions()
         codex_sessions, codex_size = self._load_codex_sessions()
+
+        if self._sort_column:
+            self._apply_sort()
 
         total_sessions = claude_sessions + desktop_sessions + codex_sessions
         total_size = claude_size + desktop_size + codex_size
@@ -635,6 +648,55 @@ class ConvoCleanerApp:
         item = self.tree.identify_row(event.y)
         if item and item.startswith("grp_"):
             self.tree.after(10, self._select_group_children, item)
+
+    def sort_by(self, column):
+        if self._sort_column == column:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_column = column
+            self._sort_reverse = False
+        self._apply_sort()
+
+    def _apply_sort(self):
+        column = self._sort_column
+        reverse = self._sort_reverse
+        for col, label in self._heading_labels.items():
+            suffix = (" ▼" if reverse else " ▲") if col == column else ""
+            self.tree.heading(col, text=label + suffix)
+
+        groups = list(self.tree.get_children())
+        if column == "#0":
+            groups.sort(key=lambda g: self.tree.item(g, "text").lower(), reverse=reverse)
+            for index, group_id in enumerate(groups):
+                self.tree.move(group_id, "", index)
+
+        for group_id in groups:
+            children = list(self.tree.get_children(group_id))
+            children.sort(key=lambda c: self._sort_key(c, column), reverse=reverse)
+            for index, child in enumerate(children):
+                self.tree.move(child, group_id, index)
+
+    def _sort_key(self, item_id, column):
+        if column == "#0":
+            return self.tree.item(item_id, "text").lower()
+        value = self.tree.set(item_id, column)
+        if column == "msgs":
+            try:
+                return int(value)
+            except ValueError:
+                return -1
+        if column == "size":
+            return self._parse_size(value)
+        return str(value).lower()
+
+    def _parse_size(self, text):
+        # Inverse of format_size, so displayed "1.2 MB" sorts by bytes rather than by string.
+        units = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}
+        try:
+            number, unit = text.split()
+            return float(number) * units[unit]
+        except (ValueError, KeyError):
+            return -1
 
     def _select_group_children(self, group_id):
         children = list(self.tree.get_children(group_id))
