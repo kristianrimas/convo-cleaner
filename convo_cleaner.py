@@ -288,6 +288,12 @@ class ConvoCleanerApp:
             except (json.JSONDecodeError, IOError):
                 continue
 
+            # Skip non-session files the app keeps here (e.g. scheduled-tasks.json)
+            if not isinstance(data, dict) or not any(
+                k in data for k in ("sessionId", "cliSessionId", "cwd", "originCwd")
+            ):
+                continue
+
             # Skip sessions that already have CLI .jsonl files
             cli_id = data.get("cliSessionId", "")
             if cli_id and cli_id in self._cli_session_ids:
