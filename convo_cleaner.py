@@ -3,6 +3,7 @@ Conversation Manager (Claude + Codex)
 A GUI tool to view and delete conversations from Claude Code and Codex.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -44,6 +45,8 @@ class ConvoCleanerApp:
         ]
         self.prompt_history_path = Path.home() / ".claude" / "history.jsonl"
         self.paste_cache_path = Path.home() / ".claude" / "paste-cache"
+        # Each open Claude Code window keeps <pid>.json here naming the session it is on
+        self.open_sessions_path = Path.home() / ".claude" / "sessions"
 
         # Data storage
         self.groups_data = {}
@@ -1090,6 +1093,56 @@ class ConvoCleanerApp:
         """Every session ID that names a transcript file on disk."""
         return {p.stem for p in self.claude_projects_path.rglob("*.jsonl")}
 
+    def _open_session_ids(self):
+        """Session IDs that open Claude Code windows are on, or None when that cannot be told.
+
+        A window rewrites its <pid>.json when /clear moves it to a new session. A file left
+        by a window that has since closed is ignored. Any file that cannot be read returns
+        None rather than a partial answer, since a missing ID would let the sweep delete a
+        live session's files.
+        """
+        if os.name != "nt" or not self.open_sessions_path.is_dir():
+            return None
+        open_ids = set()
+        try:
+            for path in self.open_sessions_path.glob("*.json"):
+                entry = json.loads(path.read_text(encoding="utf-8"))
+                pid = entry.get("pid") if isinstance(entry, dict) else None
+                session_id = entry.get("sessionId") if isinstance(entry, dict) else None
+                if not isinstance(pid, int) or not isinstance(session_id, str):
+                    return None
+                if self._process_running(pid):
+                    open_ids.add(session_id)
+        except (OSError, ValueError):
+            return None
+        return open_ids
+
+    @staticmethod
+    def _process_running(pid):
+        # os.kill(pid, 0) is the usual liveness probe, but on Windows it terminates the process.
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        ERROR_ACCESS_DENIED = 5
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # Denied access still proves the process exists.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True  # cannot tell, so keep its session protected
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+
     def _referenced_session_ids(self, candidates):
         """Of `candidates`, the session IDs still mentioned inside some surviving transcript.
 
@@ -1145,9 +1198,15 @@ class ConvoCleanerApp:
             session_parents += [d for d in sorted(self.scratchpad_path.iterdir()) if d.is_dir()]
         session_parents += [d for d in self.session_trace_paths if d.is_dir()]
 
-        # A scratchpad is created before its transcript is flushed, so treat anything touched
-        # in the last hour as live no matter what the transcript folder says.
-        cutoff = time.time() - 3600
+        # A scratchpad and prompts exist before the transcript is flushed, so a session open in
+        # a Claude Code window is live no matter what the transcript folder says. When the open
+        # windows cannot be read, anything touched in the last hour is treated as live instead.
+        open_ids = self._open_session_ids()
+        if open_ids is None:
+            cutoff = time.time() - 3600
+        else:
+            known |= open_ids
+            cutoff = float("inf")  # no time guard needed
         candidates = []
         for parent in session_parents:
             for session_dir in sorted(parent.iterdir()):

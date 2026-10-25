@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,6 +68,40 @@ class SessionTraceTests(unittest.TestCase):
         self.assertFalse((self.app.paste_cache_path / "aaaa.txt").exists())
         self.assertTrue((self.app.paste_cache_path / "bbbb.txt").exists())
         self.assertFalse((self.home / "history.jsonl.tmp").exists())
+
+
+class OpenSessionTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.app = ConvoCleanerApp.__new__(ConvoCleanerApp)
+        self.app.open_sessions_path = Path(tmp.name)
+
+    def write_window(self, pid, session_id):
+        entry = {"pid": pid, "sessionId": session_id}
+        (self.app.open_sessions_path / f"{pid}.json").write_text(json.dumps(entry), encoding="utf-8")
+
+    @unittest.skipUnless(os.name == "nt", "reads Windows process state")
+    def test_lists_only_sessions_whose_window_is_still_running(self):
+        # Popen keeps the exited process's handle open, so its PID cannot be reused mid-test.
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait()
+        self.write_window(os.getpid(), KEPT)
+        self.write_window(exited.pid, GONE)
+
+        # Probing this test's own PID also proves the check does not terminate what it probes.
+        self.assertEqual(self.app._open_session_ids(), {KEPT})
+
+    def test_unreadable_window_file_means_unknown(self):
+        self.write_window(os.getpid(), KEPT)
+        (self.app.open_sessions_path / "1.json").write_text("{half written", encoding="utf-8")
+
+        self.assertIsNone(self.app._open_session_ids())
+
+    def test_missing_folder_means_unknown(self):
+        self.app.open_sessions_path = self.app.open_sessions_path / "absent"
+
+        self.assertIsNone(self.app._open_session_ids())
 
 
 if __name__ == "__main__":
