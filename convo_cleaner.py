@@ -18,6 +18,10 @@ from tkinter import messagebox, ttk
 # sweep from touching anything in Temp\claude that is not a session folder.
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
+# paste-cache files are named <contentHash>.txt. Requiring hex keeps a malformed hash in
+# history.jsonl from naming a path outside that folder.
+CONTENT_HASH_RE = re.compile(r"^[0-9a-f]+$", re.I)
+
 
 class ConvoCleanerApp:
     def __init__(self, root):
@@ -34,6 +38,12 @@ class ConvoCleanerApp:
         self.desktop_sessions_path = Path(appdata) / "Claude" / "claude-code-sessions"
         localappdata = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
         self.scratchpad_path = Path(localappdata) / "Temp" / "claude"
+        # Other per-session folders Claude Code keeps outside the transcript, each named by session ID
+        self.session_trace_paths = [
+            Path.home() / ".claude" / name for name in ("file-history", "session-env", "uploads")
+        ]
+        self.prompt_history_path = Path.home() / ".claude" / "history.jsonl"
+        self.paste_cache_path = Path.home() / ".claude" / "paste-cache"
 
         # Data storage
         self.groups_data = {}
@@ -117,7 +127,7 @@ class ConvoCleanerApp:
         ttk.Button(btn_frame, text="Expand All", command=self.expand_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Collapse All", command=self.collapse_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(
-            btn_frame, text="Sweep Orphan Scratchpads", command=self.sweep_orphan_scratchpads
+            btn_frame, text="Sweep Orphans", command=self.sweep_orphans
         ).pack(side=tk.LEFT, padx=(15, 5))
 
         self.delete_btn = ttk.Button(btn_frame, text="Delete Selected", command=self.delete_selected)
@@ -820,7 +830,8 @@ class ConvoCleanerApp:
         confirm = messagebox.askyesno(
             "Confirm Deletion",
             f"Are you sure you want to delete {len(sessions_to_delete)} session(s)?\n\n"
-            "This will delete selected conversation files.\n"
+            "This will delete selected conversation files and what Claude Code kept for them:\n"
+            "prompt history, pastes, file-edit backups, uploads and temp scratchpads.\n"
             "This action cannot be undone!",
         )
         if not confirm:
@@ -828,6 +839,8 @@ class ConvoCleanerApp:
 
         deleted_count = 0
         scratchpads_removed = 0
+        traces_removed = 0
+        deleted_session_ids = set()
         errors = []
         removed_dirs = set()
 
@@ -876,6 +889,8 @@ class ConvoCleanerApp:
                             info["project_folder_name"], info["session_filename"], errors
                         ):
                             scratchpads_removed += 1
+                        traces_removed += self._remove_session_traces(info["session_filename"], errors)
+                        deleted_session_ids.add(info["session_filename"])
                     proj_name = info["project_folder_name"]
                     if proj_name not in claude_by_project:
                         claude_by_project[proj_name] = []
@@ -915,19 +930,30 @@ class ConvoCleanerApp:
                             errors.append(f"Failed to update index for {proj_name}: {e}")
                     break
 
+        history_removed = self._purge_prompt_history(deleted_session_ids, errors)
+
         scratch_note = (
             f"\nAlso removed {scratchpads_removed} temp scratchpad folder(s)."
             if scratchpads_removed
+            else ""
+        )
+        trace_note = (
+            f"\nAlso removed {traces_removed} backup/upload folder(s) "
+            f"and {history_removed} prompt history line(s)."
+            if traces_removed or history_removed
             else ""
         )
 
         if errors:
             messagebox.showwarning(
                 "Partial Success",
-                f"Deleted {deleted_count} session(s){scratch_note}\n\nErrors:\n" + "\n".join(errors[:5]),
+                f"Deleted {deleted_count} session(s){scratch_note}{trace_note}\n\nErrors:\n"
+                + "\n".join(errors[:5]),
             )
         else:
-            messagebox.showinfo("Success", f"Successfully deleted {deleted_count} session(s){scratch_note}")
+            messagebox.showinfo(
+                "Success", f"Successfully deleted {deleted_count} session(s){scratch_note}{trace_note}"
+            )
 
         self.load_all()
 
@@ -947,6 +973,118 @@ class ConvoCleanerApp:
             return False
         self._cleanup_empty_dirs(scratch_dir.parent, self.scratchpad_path)
         return True
+
+    def _remove_session_traces(self, session_id, errors):
+        """Delete a session's folders under file-history, session-env and uploads.
+
+        Returns how many were removed.
+        """
+        # A transcript named "..jsonl" has the stem ".", which would resolve to the trace
+        # folder itself, so only a real session UUID may name what gets deleted.
+        if not SESSION_ID_RE.match(session_id):
+            return 0
+        removed = 0
+        for parent in self.session_trace_paths:
+            trace_dir = parent / session_id
+            if not trace_dir.is_dir():
+                continue
+            try:
+                shutil.rmtree(trace_dir)
+                removed += 1
+            except OSError as e:
+                errors.append(f"Failed to delete {parent.name} for {session_id[:12]}: {e}")
+        return removed
+
+    @staticmethod
+    def _parse_history_line(line):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return {}
+        return entry if isinstance(entry, dict) else {}
+
+    @staticmethod
+    def _paste_hashes(entry):
+        pastes = entry.get("pastedContents")
+        if not isinstance(pastes, dict):
+            return set()
+        hashes = {p.get("contentHash") for p in pastes.values() if isinstance(p, dict)}
+        return {h for h in hashes if isinstance(h, str) and CONTENT_HASH_RE.match(h)}
+
+    def _idle_history_sessions(self, cutoff):
+        """Prompt line count per session in history.jsonl, for sessions with no prompt since `cutoff`.
+
+        `cutoff` is epoch seconds; history timestamps are epoch milliseconds.
+        """
+        try:
+            lines = self.prompt_history_path.read_bytes().splitlines()
+        except OSError:
+            return {}
+        counts = {}
+        newest = {}
+        for line in lines:
+            entry = self._parse_history_line(line)
+            session_id = entry.get("sessionId")
+            if not isinstance(session_id, str):
+                continue
+            counts[session_id] = counts.get(session_id, 0) + 1
+            stamp = entry.get("timestamp")
+            if isinstance(stamp, (int, float)):
+                newest[session_id] = max(newest.get(session_id, 0), stamp / 1000)
+        return {sid: n for sid, n in counts.items() if newest.get(sid, 0) <= cutoff}
+
+    def _purge_prompt_history(self, session_ids, errors):
+        """Drop these sessions' prompts from history.jsonl and the pastes only they used.
+
+        A paste is stored once in paste-cache under its contentHash and can be shared by
+        prompts from several sessions, so it goes only when no kept prompt points at it.
+        Returns how many prompt lines were removed.
+        """
+        if not session_ids or not self.prompt_history_path.exists():
+            return 0
+        try:
+            lines = self.prompt_history_path.read_bytes().splitlines(keepends=True)
+        except OSError as e:
+            errors.append(f"Failed to read prompt history: {e}")
+            return 0
+
+        # Kept lines are written back byte for byte, so nothing else in the file changes.
+        kept = []
+        dropped_hashes = set()
+        kept_hashes = set()
+        for line in lines:
+            entry = self._parse_history_line(line)
+            if entry.get("sessionId") in session_ids:
+                dropped_hashes |= self._paste_hashes(entry)
+            else:
+                kept.append(line)
+                kept_hashes |= self._paste_hashes(entry)
+
+        removed = len(lines) - len(kept)
+        if not removed:
+            return 0
+
+        # kr: a prompt Claude Code appends between the read above and the replace below drops
+        # out of up-arrow recall. The window is milliseconds, so there is no retry.
+        tmp_path = self.prompt_history_path.with_name(self.prompt_history_path.name + ".tmp")
+        try:
+            tmp_path.write_bytes(b"".join(kept))
+            os.replace(tmp_path, self.prompt_history_path)
+        except OSError as e:
+            errors.append(f"Failed to rewrite prompt history: {e}")
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return 0
+
+        for content_hash in dropped_hashes - kept_hashes:
+            paste_path = self.paste_cache_path / f"{content_hash}.txt"
+            try:
+                paste_path.unlink(missing_ok=True)
+            except OSError as e:
+                errors.append(f"Failed to delete paste {content_hash}: {e}")
+        return removed
 
     def _known_session_ids(self):
         """Every session ID that names a transcript file on disk."""
@@ -978,17 +1116,17 @@ class ConvoCleanerApp:
             found.update(match.decode("utf-8") for match in pattern.findall(blob))
         return found
 
-    def sweep_orphan_scratchpads(self):
-        """Delete temp scratchpads whose conversation no longer exists."""
-        if not self.scratchpad_path.exists():
-            messagebox.showinfo("Sweep Scratchpads", f"No scratchpad folder at:\n{self.scratchpad_path}")
-            return
+    def sweep_orphans(self):
+        """Delete what Claude Code kept for conversations that no longer exist.
 
-        # Guard: with no transcripts to compare against, every scratchpad looks orphaned
+        Covers temp scratchpads, the per-session trace folders, and prompt history lines
+        along with the pastes only those lines used.
+        """
+        # Guard: with no transcripts to compare against, every leftover looks orphaned
         # and the sweep would wipe the lot, including sessions still in use.
         if not self.claude_projects_path.exists():
             messagebox.showerror(
-                "Sweep Scratchpads",
+                "Sweep Orphans",
                 f"Claude projects folder not found:\n{self.claude_projects_path}\n\nSweep aborted.",
             )
             return
@@ -996,54 +1134,72 @@ class ConvoCleanerApp:
         known = self._known_session_ids()
         if not known:
             messagebox.showerror(
-                "Sweep Scratchpads",
+                "Sweep Orphans",
                 "No session transcripts found. Refusing to sweep in case the folder is unreadable.",
             )
             return
+
+        # Scratchpads sit one level deeper than the trace folders, under a folder per project.
+        session_parents = []
+        if self.scratchpad_path.is_dir():
+            session_parents += [d for d in sorted(self.scratchpad_path.iterdir()) if d.is_dir()]
+        session_parents += [d for d in self.session_trace_paths if d.is_dir()]
 
         # A scratchpad is created before its transcript is flushed, so treat anything touched
         # in the last hour as live no matter what the transcript folder says.
         cutoff = time.time() - 3600
         candidates = []
-        for project_dir in sorted(self.scratchpad_path.iterdir()):
-            if not project_dir.is_dir():
-                continue
-            for session_dir in sorted(project_dir.iterdir()):
+        for parent in session_parents:
+            for session_dir in sorted(parent.iterdir()):
                 if not session_dir.is_dir() or not SESSION_ID_RE.match(session_dir.name):
                     continue
                 if session_dir.name in known or session_dir.stat().st_mtime > cutoff:
                     continue
                 candidates.append(session_dir)
 
-        orphans = []
-        if candidates:
-            self.status_var.set(f"Checking {len(candidates)} scratchpad(s) against transcript history...")
-            self.root.update_idletasks()
-            referenced = self._referenced_session_ids({d.name for d in candidates})
-            orphans = [d for d in candidates if d.name not in referenced]
+        history_counts = {
+            sid: n for sid, n in self._idle_history_sessions(cutoff).items() if sid not in known
+        }
 
-        kept = len(candidates) - len(orphans)
+        orphans = []
+        orphan_history_ids = set()
+        if candidates or history_counts:
+            self.status_var.set(
+                f"Checking {len(candidates) + len(history_counts)} leftover(s) against transcript history..."
+            )
+            self.root.update_idletasks()
+            referenced = self._referenced_session_ids({d.name for d in candidates} | set(history_counts))
+            orphans = [d for d in candidates if d.name not in referenced]
+            orphan_history_ids = set(history_counts) - referenced
+
+        kept = len(candidates) - len(orphans) + len(history_counts) - len(orphan_history_ids)
         kept_note = f"\n{kept} kept: still referenced by a surviving conversation.\n" if kept else ""
 
-        if not orphans:
-            messagebox.showinfo("Sweep Scratchpads", f"No orphaned scratchpads found.\n{kept_note}")
-            self.status_var.set(f"No orphaned scratchpads found ({kept} kept as referenced)")
+        if not orphans and not orphan_history_ids:
+            messagebox.showinfo("Sweep Orphans", f"No orphaned leftovers found.\n{kept_note}")
+            self.status_var.set(f"No orphaned leftovers found ({kept} kept as referenced)")
             return
 
         total = sum(self._dir_size(d) for d in orphans)
         preview = "\n".join(f"   {d.parent.name} / {d.name[:8]}..." for d in orphans[:10])
         if len(orphans) > 10:
             preview += f"\n   ...and {len(orphans) - 10} more"
+        history_lines = sum(history_counts[sid] for sid in orphan_history_ids)
+        history_note = (
+            f"\nPlus {history_lines} prompt history line(s) from {len(orphan_history_ids)} ended session(s).\n"
+            if orphan_history_ids
+            else ""
+        )
 
         confirm = messagebox.askyesno(
-            "Sweep Orphan Scratchpads",
-            f"Found {len(orphans)} orphaned scratchpad folder(s) using {self.format_size(total)}:\n\n"
-            f"{preview}\n{kept_note}\n"
-            "No surviving conversation continues these sessions. Delete these temp files?\n"
+            "Sweep Orphans",
+            f"Found {len(orphans)} orphaned folder(s) using {self.format_size(total)}:\n\n"
+            f"{preview}\n{history_note}{kept_note}\n"
+            "No surviving conversation continues these sessions. Delete these leftovers?\n"
             "This action cannot be undone!",
         )
         if not confirm:
-            self.status_var.set(f"Sweep cancelled ({len(orphans)} orphaned scratchpad(s) found)")
+            self.status_var.set(f"Sweep cancelled ({len(orphans)} orphaned folder(s) found)")
             return
 
         removed = 0
@@ -1056,17 +1212,22 @@ class ConvoCleanerApp:
             except OSError as e:
                 errors.append(f"{session_dir.name[:12]}: {e}")
 
+        history_removed = self._purge_prompt_history(orphan_history_ids, errors)
+
         if errors:
             messagebox.showwarning(
                 "Partial Success",
-                f"Removed {removed} of {len(orphans)} scratchpad(s)\n\nErrors:\n" + "\n".join(errors[:5]),
+                f"Removed {removed} of {len(orphans)} folder(s) and {history_removed} prompt history line(s)"
+                "\n\nErrors:\n" + "\n".join(errors[:5]),
             )
         else:
             messagebox.showinfo(
-                "Success", f"Removed {removed} orphaned scratchpad(s), freeing {self.format_size(total)}"
+                "Success",
+                f"Removed {removed} orphaned folder(s), freeing {self.format_size(total)}, "
+                f"and {history_removed} prompt history line(s)",
             )
 
-        self.status_var.set(f"Swept {removed} orphaned scratchpad(s)")
+        self.status_var.set(f"Swept {removed} orphaned folder(s) and {history_removed} prompt history line(s)")
 
     def _cleanup_empty_dirs(self, start_dir, stop_dir):
         current = start_dir
