@@ -9,6 +9,8 @@ import json
 import os
 import re
 import shutil
+import sqlite3
+import subprocess
 import time
 import tkinter as tk
 from datetime import datetime
@@ -23,6 +25,18 @@ SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 # history.jsonl from naming a path outside that folder.
 CONTENT_HASH_RE = re.compile(r"^[0-9a-f]+$", re.I)
 
+# Codex names each session log rollout-<time>-<session id>.jsonl and compresses older ones
+# to .jsonl.zst. The ID also names the session's folder in generated_images.
+CODEX_ROLLOUT_RE = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(\.zst)?$", re.I
+)
+
+# A Codex session whose log changed this recently may still be running, for example a
+# picture job a skill started. Deleting it would also delete the picture it is about to make.
+CODEX_LIVE_SECONDS = 600
+
+CODEX_CLI_MISSING = "Codex CLI not found: removed the session files, but Codex's own history may still list them."
+
 
 class ConvoCleanerApp:
     def __init__(self, root):
@@ -33,8 +47,11 @@ class ConvoCleanerApp:
 
         # Paths
         self.claude_projects_path = Path.home() / ".claude" / "projects"
-        self.codex_sessions_path = Path.home() / ".codex" / "sessions"
-        self.codex_archived_path = Path.home() / ".codex" / "archived_sessions"
+        self.codex_home = Path.home() / ".codex"
+        self.codex_sessions_path = self.codex_home / "sessions"
+        self.codex_archived_path = self.codex_home / "archived_sessions"
+        # Every picture a Codex session makes is kept here, in a folder named by session ID
+        self.codex_images_path = self.codex_home / "generated_images"
         appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
         self.desktop_sessions_path = Path(appdata) / "Claude" / "claude-code-sessions"
         localappdata = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
@@ -140,14 +157,17 @@ class ConvoCleanerApp:
             side=tk.RIGHT, padx=(0, 10)
         )
 
-        # Agent-only selection, with an age guard so a session you are still working in
-        # never has its subagent transcripts swept up. Packed right-to-left, so this
-        # reads as: [keep newer than (days)] [3] [Select [agent]].
+        # Agent-only and Codex-only selection, with an age guard so a session you are still
+        # working in is never swept up. Packed right-to-left, so this reads as:
+        # [keep newer than (days)] [3] [Select [Codex]] [Select [agent]].
         ttk.Button(btn_frame, text="Select [agent]", command=self.select_agent_sessions).pack(
             side=tk.RIGHT, padx=(0, 10)
         )
-        self.agent_age_var = tk.StringVar(value="3")
-        ttk.Spinbox(btn_frame, from_=0, to=365, width=4, textvariable=self.agent_age_var).pack(
+        ttk.Button(btn_frame, text="Select [Codex]", command=self.select_codex_sessions).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        self.age_guard_var = tk.StringVar(value="3")
+        ttk.Spinbox(btn_frame, from_=0, to=365, width=4, textvariable=self.age_guard_var).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
         ttk.Label(btn_frame, text="keep newer than (days):").pack(side=tk.RIGHT)
@@ -373,6 +393,7 @@ class ConvoCleanerApp:
     def _load_codex_sessions(self):
         total_sessions = 0
         total_size = 0
+        threads = self._codex_threads()
 
         all_entries = []
         if self.codex_sessions_path.exists():
@@ -414,20 +435,40 @@ class ConvoCleanerApp:
 
             for entry in entries:
                 jsonl_path = entry["path"]
-                session_rel = entry["session_rel"]
-                si = self._parse_codex_session(jsonl_path)
+                session_id = entry["session_id"]
+                thread = threads.get(session_id, {})
+                if jsonl_path.suffix == ".zst":
+                    # Compressed logs can't be read without a zstd library, so Codex's own
+                    # index supplies the summary and dates.
+                    summary = self._first_meaningful_line(thread.get("name") or thread.get("title") or "")
+                    msgs = ""
+                    created = self._format_epoch_ms(thread.get("created_ms"))
+                    modified = self._format_epoch_ms(thread.get("updated_ms"))
+                    cwd = thread.get("cwd", "")
+                else:
+                    si = self._parse_codex_session(jsonl_path)
+                    summary = si.get("summary", "")
+                    msgs = si.get("message_count", 0)
+                    created = self._format_date(si.get("created", ""))
+                    modified = self._format_date(si.get("modified", ""))
+                    cwd = si.get("cwd", "")
 
-                size = self._get_file_size(jsonl_path)
-                total_size += jsonl_path.stat().st_size if jsonl_path.exists() else 0
+                # Size counts the session's pictures too, since deleting it removes them.
+                file_size = jsonl_path.stat().st_size if jsonl_path.exists() else 0
+                pictures = self._codex_pictures_dir(session_id)
+                if pictures and pictures.is_dir():
+                    file_size += self._dir_size(pictures)
+                total_size += file_size
 
                 session_iid = self._make_iid("sess", f"codex:{jsonl_path}")
-                display_name = Path(session_rel).stem
+                display_name = jsonl_path.name.split(".jsonl")[0]
                 if len(display_name) > 56:
                     display_name = display_name[:53] + "..."
 
                 self.session_lookup[session_iid] = {
                     "source": "codex",
                     "jsonl_path": jsonl_path,
+                    "session_id": session_id,
                     "root_path": entry["root_path"],
                     "group_iid": group_iid,
                 }
@@ -435,13 +476,13 @@ class ConvoCleanerApp:
                 self.tree.insert(
                     group_node, tk.END, iid=session_iid, text=display_name,
                     values=(
-                        si.get("summary", ""),
-                        si.get("message_count", 0),
-                        self._format_date(si.get("created", "")),
-                        self._format_date(si.get("modified", "")),
-                        "",
-                        self._shorten_path(si.get("cwd", "")),
-                        size,
+                        summary[:120],
+                        msgs,
+                        created,
+                        modified,
+                        thread.get("source", ""),  # exec (a script's job) or the app it came from
+                        self._shorten_path(cwd.removeprefix("\\\\?\\")),
+                        self.format_size(file_size),
                     ),
                     tags=("session",),
                 )
@@ -451,7 +492,10 @@ class ConvoCleanerApp:
 
     def _collect_codex_entries(self, root_path, storage, label_prefix):
         entries = []
-        for jsonl_path in root_path.rglob("*.jsonl"):
+        for jsonl_path in root_path.rglob("*.jsonl*"):
+            if not jsonl_path.name.endswith((".jsonl", ".jsonl.zst")):
+                continue
+            match = CODEX_ROLLOUT_RE.search(jsonl_path.name)
             rel_path = jsonl_path.relative_to(root_path)
             parent_rel = str(rel_path.parent).replace("\\", "/")
             if parent_rel == ".":
@@ -465,8 +509,54 @@ class ConvoCleanerApp:
                 "root_path": root_path,
                 "session_rel": str(rel_path).replace("\\", "/"),
                 "path": jsonl_path,
+                "session_id": match.group(1).lower() if match else None,
             })
         return entries
+
+    def _codex_threads(self):
+        """Codex's own index of its sessions (title, source, dates, cwd) by session ID.
+
+        It lives in the newest state_<n>.sqlite and is read-only here. An empty dict when it
+        is missing or unreadable, so the list still loads from the session files alone.
+        """
+        def version(path):
+            try:
+                return int(path.stem.split("_")[-1])
+            except ValueError:
+                return -1
+
+        dbs = sorted(self.codex_home.glob("state_*.sqlite"), key=version)
+        if not dbs:
+            return {}
+        threads = {}
+        try:
+            con = sqlite3.connect(f"{dbs[-1].as_uri()}?mode=ro", uri=True, timeout=2)
+            try:
+                con.row_factory = sqlite3.Row
+                for row in con.execute("SELECT * FROM threads"):
+                    keys = row.keys()
+                    created = row["created_at_ms"] if "created_at_ms" in keys else None
+                    updated = row["updated_at_ms"] if "updated_at_ms" in keys else None
+                    threads[str(row["id"]).lower()] = {
+                        "title": row["title"] if "title" in keys else "",
+                        "name": row["name"] if "name" in keys else "",
+                        "source": row["source"] if "source" in keys else "",
+                        "cwd": row["cwd"] if "cwd" in keys else "",
+                        "created_ms": created or (row["created_at"] * 1000 if "created_at" in keys else None),
+                        "updated_ms": updated or (row["updated_at"] * 1000 if "updated_at" in keys else None),
+                    }
+            finally:
+                con.close()
+        except (sqlite3.Error, OSError, TypeError, IndexError):
+            return {}
+        return threads
+
+    def _codex_pictures_dir(self, session_id):
+        """The session's folder in generated_images, or None when there is no valid ID."""
+        # Only a real session UUID may name what gets deleted, never the pictures root itself.
+        if not session_id or not SESSION_ID_RE.match(session_id):
+            return None
+        return self.codex_images_path / session_id
 
     # ── Claude Session Parsing ────────────────────────────────────
 
@@ -757,8 +847,26 @@ class ConvoCleanerApp:
         agents you are not finished with. Anything modified inside the window is left
         alone, and the count is reported so a skip is never silent.
         """
+        # Only Claude CLI sessions have subagent transcripts.
+        self._select_older_than(
+            lambda info: info.get("source") == "claude" and "agent-" in info.get("session_filename", ""),
+            "[agent]",
+        )
+
+    def select_codex_sessions(self):
+        """Select every Codex session older than the age guard.
+
+        Most are picture jobs that skills ran through `codex exec`. Each skill copies its
+        picture into the project as soon as the job ends, so an old session is only its log
+        and Codex's own copy of that picture. The guard keeps recent ones in case work in
+        progress still needs a picture from generated_images.
+        """
+        self._select_older_than(lambda info: info.get("source") == "codex", "Codex")
+
+    def _select_older_than(self, wanted, label):
+        """Select the sessions `wanted(info)` accepts whose file is older than the age guard."""
         try:
-            days = int(self.agent_age_var.get())
+            days = int(self.age_guard_var.get())
             if days < 0:
                 raise ValueError
         except ValueError:
@@ -771,10 +879,7 @@ class ConvoCleanerApp:
         for group_id in self.tree.get_children():
             for session_id in self.tree.get_children(group_id):
                 info = self.session_lookup.get(session_id) or {}
-                # Only Claude CLI sessions have subagent transcripts.
-                if info.get("source") != "claude":
-                    continue
-                if "agent-" not in info.get("session_filename", ""):
+                if not wanted(info):
                     continue
                 path = info.get("jsonl_path")
                 try:
@@ -793,10 +898,10 @@ class ConvoCleanerApp:
                 self.tree.item(gid, open=True)
             self.tree.see(matched[0])
             note = f", {skipped} kept (newer than {days}d)" if skipped else ""
-            self.status_var.set(f"{len(matched)} [agent] session(s) selected{note}")
+            self.status_var.set(f"{len(matched)} {label} session(s) selected{note}")
         else:
             self.status_var.set(
-                f"No [agent] sessions older than {days} day(s)"
+                f"No {label} sessions older than {days} day(s)"
                 + (f" ({skipped} kept as too recent)" if skipped else "")
             )
 
@@ -830,11 +935,21 @@ class ConvoCleanerApp:
             messagebox.showinfo("Info", "Please select sessions to delete (not group folders)")
             return
 
+        codex_count = sum(
+            1 for item in sessions_to_delete if (self.session_lookup.get(item) or {}).get("source") == "codex"
+        )
+        codex_note = (
+            f"The {codex_count} Codex session(s) also lose their generated pictures "
+            "and their entry in Codex's history.\n"
+            if codex_count
+            else ""
+        )
         confirm = messagebox.askyesno(
             "Confirm Deletion",
             f"Are you sure you want to delete {len(sessions_to_delete)} session(s)?\n\n"
             "This will delete selected conversation files and what Claude Code kept for them:\n"
             "prompt history, pastes, file-edit backups, uploads and temp scratchpads.\n"
+            f"{codex_note}"
             "This action cannot be undone!",
         )
         if not confirm:
@@ -843,6 +958,7 @@ class ConvoCleanerApp:
         deleted_count = 0
         scratchpads_removed = 0
         traces_removed = 0
+        pictures_removed = 0
         deleted_session_ids = set()
         errors = []
         removed_dirs = set()
@@ -850,13 +966,17 @@ class ConvoCleanerApp:
         # Track Claude deletions by project for index updates
         claude_by_project = {}
 
-        for item_id in sessions_to_delete:
+        for n, item_id in enumerate(sessions_to_delete, 1):
             info = self.session_lookup.get(item_id)
             if not info:
                 errors.append(f"Session data not found: {item_id}")
                 continue
 
             source = info["source"]
+            # Each Codex deletion runs the Codex CLI, so a big batch takes minutes; show progress.
+            if source == "codex" and n % 5 == 0:
+                self.status_var.set(f"Deleting {n} of {len(sessions_to_delete)}...")
+                self.root.update_idletasks()
 
             if source == "desktop":
                 json_path = info["json_path"]
@@ -900,10 +1020,13 @@ class ConvoCleanerApp:
                     claude_by_project[proj_name].append(info["session_filename"])
 
                 elif source == "codex":
-                    jsonl_path.unlink()
-                    root_path = info.get("root_path")
-                    if root_path and root_path.exists():
-                        self._cleanup_empty_dirs(jsonl_path.parent, root_path)
+                    if time.time() - jsonl_path.stat().st_mtime < CODEX_LIVE_SECONDS:
+                        errors.append(
+                            f"Skipped {jsonl_path.name[:40]}: changed in the last 10 minutes, may still be running"
+                        )
+                        continue
+                    if self._delete_codex_session(info, errors):
+                        pictures_removed += 1
 
                 deleted_count += 1
 
@@ -946,19 +1069,74 @@ class ConvoCleanerApp:
             if traces_removed or history_removed
             else ""
         )
+        picture_note = f"\nAlso removed {pictures_removed} Codex picture folder(s)." if pictures_removed else ""
 
         if errors:
+            more = f"\n...and {len(errors) - 5} more" if len(errors) > 5 else ""
             messagebox.showwarning(
                 "Partial Success",
-                f"Deleted {deleted_count} session(s){scratch_note}{trace_note}\n\nErrors:\n"
-                + "\n".join(errors[:5]),
+                f"Deleted {deleted_count} session(s){scratch_note}{trace_note}{picture_note}\n\nErrors:\n"
+                + "\n".join(errors[:5]) + more,
             )
         else:
             messagebox.showinfo(
-                "Success", f"Successfully deleted {deleted_count} session(s){scratch_note}{trace_note}"
+                "Success",
+                f"Successfully deleted {deleted_count} session(s){scratch_note}{trace_note}{picture_note}",
             )
 
         self.load_all()
+
+    def _delete_codex_session(self, info, errors):
+        """Delete one Codex session: its log, Codex's own index entries for it, and its pictures.
+
+        `codex delete` removes the log and the session's rows in Codex's databases, so the
+        session also leaves Codex's history. It leaves generated_images/<id> behind, so that
+        is removed here. When the Codex CLI is missing or fails, only the files go, and
+        Codex's index keeps an entry for a log that no longer exists.
+        Returns True when a pictures folder was removed.
+        """
+        jsonl_path = info["jsonl_path"]
+        session_id = info.get("session_id")
+        if session_id and SESSION_ID_RE.match(session_id):
+            result = self._codex_cli_delete(session_id)
+            if result is None:
+                if CODEX_CLI_MISSING not in errors:
+                    errors.append(CODEX_CLI_MISSING)
+            elif not result:
+                errors.append(f"codex delete failed for {session_id[:13]}: removed its files only")
+
+        if jsonl_path.exists():
+            jsonl_path.unlink()
+        root_path = info.get("root_path")
+        if root_path and root_path.exists():
+            self._cleanup_empty_dirs(jsonl_path.parent, root_path)
+
+        pictures = self._codex_pictures_dir(session_id)
+        if not pictures or not pictures.is_dir():
+            return False
+        try:
+            shutil.rmtree(pictures)
+        except OSError as e:
+            errors.append(f"Failed to delete pictures for {session_id[:13]}: {e}")
+            return False
+        return True
+
+    def _codex_cli_delete(self, session_id):
+        """Run `codex delete --force <id>`: True on success, False on failure, None without the CLI."""
+        exe = shutil.which("codex")
+        if not exe:
+            return None
+        try:
+            result = subprocess.run(
+                [exe, "delete", "--force", session_id],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
 
     def _remove_scratchpad(self, project_folder_name, session_filename, errors):
         """Delete the temp scratchpad (screenshots, scratch scripts) a session left behind.
