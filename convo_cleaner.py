@@ -756,7 +756,10 @@ class ConvoCleanerApp:
     def on_click(self, event):
         item = self.tree.identify_row(event.y)
         if item and item.startswith("grp_"):
-            self.tree.after(10, self._select_group_children, item)
+            # Ctrl (0x4) or Shift (0x1) held: add to the selection instead of replacing it,
+            # so several folders can be picked at once.
+            additive = bool(event.state & 0x0005)
+            self.tree.after(10, self._select_group_children, item, additive)
 
     def sort_by(self, column):
         if self._sort_column == column:
@@ -807,10 +810,24 @@ class ConvoCleanerApp:
         except (ValueError, KeyError):
             return -1
 
-    def _select_group_children(self, group_id):
-        children = list(self.tree.get_children(group_id))
-        if children:
-            self.tree.selection_set(children + [group_id])
+    def _select_group_children(self, group_id, additive=False):
+        if not additive:
+            children = list(self.tree.get_children(group_id))
+            if children:
+                self.tree.selection_set(children + [group_id])
+            return
+
+        # Tk has already applied the Ctrl/Shift click to the folder rows. A Ctrl-click on a
+        # selected folder toggles it off: its sessions go with it.
+        if group_id not in self.tree.selection():
+            self.tree.selection_remove(list(self.tree.get_children(group_id)))
+        # Every folder now selected (Shift picks a whole range) brings its sessions along.
+        sessions = []
+        for gid in self.tree.selection():
+            if gid.startswith("grp_"):
+                sessions.extend(self.tree.get_children(gid))
+        if sessions:
+            self.tree.selection_add(sessions)
 
     def on_select(self, event):
         selected = self.tree.selection()

@@ -219,5 +219,69 @@ class CodexTests(unittest.TestCase):
         self.assertEqual(self.app._codex_threads(), {})
 
 
+class FakeTree:
+    """Just the Treeview selection calls _select_group_children uses."""
+
+    def __init__(self, groups, selected=()):
+        self.groups = groups
+        self.selected = list(selected)
+
+    def get_children(self, item=""):
+        return tuple(self.groups.get(item, ()))
+
+    def selection(self):
+        return tuple(self.selected)
+
+    def selection_set(self, items):
+        self.selected = list(items)
+
+    def selection_add(self, items):
+        self.selected += [i for i in items if i not in self.selected]
+
+    def selection_remove(self, items):
+        self.selected = [i for i in self.selected if i not in items]
+
+
+class FolderSelectionTests(unittest.TestCase):
+    GROUPS = {"grp_a": ["sess_a1", "sess_a2"], "grp_b": ["sess_b1"], "grp_c": ["sess_c1"]}
+
+    def app_with(self, selected):
+        app = ConvoCleanerApp.__new__(ConvoCleanerApp)
+        app.tree = FakeTree(self.GROUPS, selected)
+        return app
+
+    def test_plain_click_selects_only_that_folders_sessions(self):
+        app = self.app_with(["sess_a1", "grp_a", "grp_b"])
+
+        app._select_group_children("grp_b")
+
+        self.assertEqual(set(app.tree.selected), {"sess_b1", "grp_b"})
+
+    def test_ctrl_click_adds_a_second_folder_and_keeps_the_first(self):
+        # After a click on grp_a, then Ctrl+click on grp_b (Tk has added the grp_b row).
+        app = self.app_with(["sess_a1", "sess_a2", "grp_a", "grp_b"])
+
+        app._select_group_children("grp_b", additive=True)
+
+        self.assertEqual(set(app.tree.selected), {"grp_a", "sess_a1", "sess_a2", "grp_b", "sess_b1"})
+
+    def test_shift_click_range_selects_every_folders_sessions(self):
+        app = self.app_with(["grp_a", "grp_b", "grp_c"])
+
+        app._select_group_children("grp_c", additive=True)
+
+        self.assertEqual(
+            set(app.tree.selected), {"grp_a", "grp_b", "grp_c", "sess_a1", "sess_a2", "sess_b1", "sess_c1"}
+        )
+
+    def test_ctrl_click_on_a_selected_folder_drops_its_sessions(self):
+        # Tk's Ctrl+click has toggled the grp_a row off.
+        app = self.app_with(["sess_a1", "sess_a2", "grp_b", "sess_b1"])
+
+        app._select_group_children("grp_a", additive=True)
+
+        self.assertEqual(set(app.tree.selected), {"grp_b", "sess_b1"})
+
+
 if __name__ == "__main__":
     unittest.main()
